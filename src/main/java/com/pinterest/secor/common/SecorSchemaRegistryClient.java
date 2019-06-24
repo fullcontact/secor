@@ -61,14 +61,33 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
         serializer = new KafkaAvroSerializer(schemaRegistryClient);
     }
 
+    protected Schema getLatestSchemaVersionForTopic(String topic) {
+        try {
+            SchemaMetadata schemaMetadata = schemaRegistryClient.getLatestSchemaMetadata(topic + "-value");
+            return schemaRegistryClient.getBySubjectAndId(schemaMetadata.getSchema(), schemaMetadata.getId());
+        } catch (Exception e) {
+            LOG.error("Can not fetch latest schema version: ", e);
+        }
+        return null;
+    }
+
     public GenericRecord deserialize(String topic, byte[] message) {
         if (message.length == 0) {
             message = null;
         }
-        GenericRecord record = (GenericRecord) deserializer.deserialize(topic, message);
+
+        // lets rely on CachedSchemaRegistryClient
+        Schema latestSchema = getLatestSchemaVersionForTopic(topic);
+        GenericRecord record = null;
+        if (latestSchema != null) {
+            record = (GenericRecord) deserializer.deserialize(topic, message, latestSchema);
+        } else {
+            record = (GenericRecord) deserializer.deserialize(topic, message);
+        }
+
         if (record != null) {
-            Schema schema = record.getSchema();
-            schemas.put(topic, schema);
+            LOG.debug("Storing topic '" + topic + "' schema:" + record.getSchema() +", record:" + record.toString());
+            schemas.put(topic, latestSchema != null ? latestSchema : record.getSchema());
         }
         return record;
     }

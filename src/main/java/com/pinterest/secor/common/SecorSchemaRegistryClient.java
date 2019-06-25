@@ -42,6 +42,7 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
     protected KafkaAvroSerializer serializer;
     private final static Map<String, Schema> schemas = new ConcurrentHashMap<>();
     protected SchemaRegistryClient schemaRegistryClient;
+    private SchemaMetadata lastestSchemaMetadata;
 
     public SecorSchemaRegistryClient(SecorConfig config) {
         try {
@@ -63,8 +64,10 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
 
     protected Schema getLatestSchemaVersionForTopic(String topic) {
         try {
-            SchemaMetadata schemaMetadata = schemaRegistryClient.getLatestSchemaMetadata(topic + "-value");
-            return schemaRegistryClient.getBySubjectAndId(schemaMetadata.getSchema(), schemaMetadata.getId());
+            if (lastestSchemaMetadata == null) {
+                lastestSchemaMetadata = schemaRegistryClient.getLatestSchemaMetadata(topic + "-value");
+            }
+            return schemaRegistryClient.getBySubjectAndId(lastestSchemaMetadata.getSchema(), lastestSchemaMetadata.getId());
         } catch (Exception e) {
             LOG.error("Can not fetch latest schema version: ", e);
         }

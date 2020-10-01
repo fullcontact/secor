@@ -130,7 +130,15 @@ public class AvroParquetFileReaderWriterFactory implements FileReaderWriterFacto
             GenericRecord record = schemaRegistry.deserialize(topic, keyValue.getValue());
             LOG.trace("Writing record {}", record);
             if (record != null){
-                writer.write(record);
+                try {
+                    writer.write(record);
+                }catch(ClassCastException e){
+                    LOG.error("avroSchema {}", record.getSchema().toString(true));
+                    LOG.error("offset {} failed to write record {}",
+                            keyValue.getOffset(),
+                            record,
+                            e);
+                }
             }
         }
 

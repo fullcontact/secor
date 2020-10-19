@@ -44,6 +44,8 @@
         <encoding>UTF-8</encoding>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <parquet.version>1.11.1</parquet.version>
+        <parquet.fix.version>1.11.1-avro-fix</parquet.fix.version>
+
 
         <!-- Whether we will using legazy old consumer kafka-legacy or new consumer kafka-2.0.0 -->
         <!-- Name of the directory below src/main/config that contains kafka-version-specific settings -->
@@ -127,7 +129,7 @@
         <dependency>
             <groupId>org.apache.parquet</groupId>
             <artifactId>parquet-avro</artifactId>
-            <version>${parquet.version}</version>
+            <version>${parquet.fix.version}</version>
         </dependency>
         <dependency>
             <groupId>com.google.protobuf</groupId>

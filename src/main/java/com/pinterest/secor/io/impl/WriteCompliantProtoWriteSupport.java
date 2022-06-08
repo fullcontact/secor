@@ -378,6 +378,10 @@ public class WriteCompliantProtoWriteSupport<T extends MessageOrBuilder> extends
         final void writeField(Object value) {
             List<?> list = (List<?>) value;
             if (list.isEmpty()) {
+                recordConsumer.startField(fieldName, index);
+                recordConsumer.startGroup();
+                recordConsumer.endGroup();
+                recordConsumer.endField(fieldName, index);
                 return;
             }
 

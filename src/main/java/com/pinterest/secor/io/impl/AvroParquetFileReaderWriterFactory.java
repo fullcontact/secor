@@ -135,7 +135,8 @@ public class AvroParquetFileReaderWriterFactory implements FileReaderWriterFacto
                     writer.write(record);
                 }
             } catch (Exception ex){
-                LOG.warn("Skipped record due to deserialization exception", ex);
+                LOG.warn("Skipped record due to deserialization exception: {} {}",
+                        ex.getClass().getName(), ex.getMessage());
             }
         }
 

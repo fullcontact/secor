@@ -19,7 +19,6 @@
 package com.pinterest.secor.io;
 
 import java.io.*;
-import java.net.URI;
 
 import org.apache.commons.configuration.PropertiesConfiguration;
 import org.apache.hadoop.conf.Configuration;
@@ -55,7 +54,12 @@ import junit.framework.TestCase;
  * @author Praveen Murugesan (praveen@uber.com)
  */
 @RunWith(PowerMockRunner.class)
-@PrepareForTest({FileSystem.class, FileUtil.class, DelimitedTextFileReaderWriterFactory.class,
+/* Do NOT add org.apache.hadoop.fs.FileSystem to @PrepareForTest. When PowerMock instruments
+ * FileSystem, its static initializer loads the nested FileSystem$Cache class through the
+ * PowerMock class loader, and that javassist transformation intermittently fails with
+ * "FileSystem$Cache$Key class is frozen", taking every test in this class down with it
+ * (flaky on Jenkins). Mock FileSystem instances are injected via FileUtil.getFileSystem instead. */
+@PrepareForTest({FileUtil.class, DelimitedTextFileReaderWriterFactory.class,
                  SequenceFile.class, SequenceFileReaderWriterFactory.class, GzipCodec.class,
                  FileInputStream.class, FileOutputStream.class})
 @PowerMockIgnore({
@@ -109,11 +113,11 @@ public class FileReaderWriterFactoryTest extends TestCase {
     }
 
     private void mockDelimitedTextFileWriter(boolean isCompressed) throws Exception {
-        PowerMockito.mockStatic(FileSystem.class);
+        // Hand the factory a mock FileSystem through FileUtil (prepared for test) instead of
+        // mocking FileSystem.get statically; see the note on @PrepareForTest above.
         FileSystem fs = Mockito.mock(FileSystem.class);
-        Mockito.when(
-                FileSystem.get(Mockito.any(URI.class),
-                        Mockito.any(Configuration.class))).thenReturn(fs);
+        PowerMockito.stub(PowerMockito.method(FileUtil.class, "getFileSystem", String.class))
+                .toReturn(fs);
 
         Path fsPath = (!isCompressed) ? new Path(PATH) : new Path(PATH_GZ);
 
@@ -142,16 +146,8 @@ public class FileReaderWriterFactoryTest extends TestCase {
 
     private void mockSequenceFileWriter(boolean isCompressed)
             throws Exception {
-        /* We have issues on mockito/javassist with FileSystem.class on JDK 9
-        Caused by: java.lang.IllegalStateException: Failed to transform class with name org.apache.hadoop.fs.FileSystem$Cache. Reason: org.apache.hadoop.fs.FileSystem$Cache$Key class is frozen
-
-        PowerMockito.mockStatic(FileSystem.class);
-        FileSystem fs = Mockito.mock(FileSystem.class);
-        Mockito.when(
-                FileSystem.get(Mockito.any(URI.class),
-                        Mockito.any(Configuration.class))).thenReturn(fs);
-         */
-
+        // The real (local) FileSystem is fine here: every FileSystem-touching call below is
+        // intercepted at the SequenceFile level, so FileSystem itself is not mocked.
         Path fsPath = (!isCompressed) ? new Path(PATH) : new Path(PATH_GZ);
 
         SequenceFile.Reader reader = PowerMockito

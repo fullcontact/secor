@@ -106,6 +106,36 @@ public class SecorSchemaRegistryClientTest extends TestCase {
     }
 
     @Test
+    public void testGetSchemaReturnsLatestRegisteredSchemaRegardlessOfRecordOrder() {
+        String topic = "test-avr-topic-4";
+        Schema schemaV1 = SchemaBuilder.record("Foo")
+                .fields()
+                .name("data_field_1").type().intType().noDefault()
+                .name("timestamp").type().longType().noDefault()
+                .endRecord();
+        Schema schemaV2 = SchemaBuilder.record("Foo")
+                .fields()
+                .name("data_field_1").type().intType().noDefault()
+                .name("data_field_2").type().stringType().stringDefault("")
+                .name("timestamp").type().longType().noDefault()
+                .endRecord();
+        byte[] payloadV1 = avroSerializer.serialize(topic, new GenericRecordBuilder(schemaV1)
+                .set("data_field_1", 1)
+                .set("timestamp", 1467176315L)
+                .build());
+        byte[] payloadV2 = avroSerializer.serialize(topic, new GenericRecordBuilder(schemaV2)
+                .set("data_field_1", 2)
+                .set("data_field_2", "hello")
+                .set("timestamp", 1467176316L)
+                .build());
+
+        // A producer still on v1 after v2 is registered must not roll the file schema back.
+        secorSchemaRegistryClient.deserialize(topic, payloadV2);
+        secorSchemaRegistryClient.deserialize(topic, payloadV1);
+        assertEquals(schemaV2, secorSchemaRegistryClient.getSchema(topic));
+    }
+
+    @Test
     public void testGetSchema() throws IOException, RestClientException {
         Schema expectedSchema = SchemaBuilder.record("Foo")
                 .fields()

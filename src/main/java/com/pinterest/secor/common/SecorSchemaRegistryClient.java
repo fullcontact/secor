@@ -32,6 +32,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
@@ -40,7 +41,12 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
 
     protected KafkaAvroDeserializer deserializer;
     protected KafkaAvroSerializer serializer;
+    // Static so every instance shares them: a new client is built for each file writer, and the
+    // parser's deserialize calls are what reveal newly registered schema versions.
+    // Latest schema registered for each topic; used as the schema of newly created files.
     private final static Map<String, Schema> schemas = new ConcurrentHashMap<>();
+    // Schema versions already seen in records of each topic.
+    private final static Map<String, Set<Schema>> seenSchemas = new ConcurrentHashMap<>();
     protected SchemaRegistryClient schemaRegistryClient;
 
     public SecorSchemaRegistryClient(SecorConfig config) {
@@ -66,16 +72,29 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
             message = null;
         }
         GenericRecord record = (GenericRecord) deserializer.deserialize(topic, message);
-        if (record != null) {
-            Schema schema = record.getSchema();
-            schemas.put(topic, schema);
+        if (record != null && seenSchemas.computeIfAbsent(topic, t -> ConcurrentHashMap.newKeySet())
+                .add(record.getSchema())) {
+            refreshLatestSchema(topic, record.getSchema());
         }
         return record;
     }
 
+    // A schema version not seen before may have been registered since the cached latest schema
+    // was fetched. Records on older versions do not replace it, so files keep the newest fields.
+    private void refreshLatestSchema(String topic, Schema recordSchema) {
+        try {
+            schemas.put(topic, fetchLatestSchema(topic));
+        } catch (IllegalStateException e) {
+            // Topics whose schema is not registered under "<topic>-value" can only be written
+            // with a schema taken from their records.
+            LOG.warn("Unable to refresh Avro schema for topic {}; keeping the cached schema", topic, e);
+            schemas.putIfAbsent(topic, recordSchema);
+        }
+    }
+
     /**
-     * Get Avro schema of a topic. It uses the cache that either is set by calling {@link #deserialize(String, byte[])}
-     * or querying this method to avoid hitting Schema Registry for each call.
+     * Get the latest Avro schema registered for a topic. It is cached, and refreshed by
+     * {@link #deserialize(String, byte[])} whenever a record carries a schema version not seen before.
      * It uses standard "subject name" strategy and it is topic_name-value.
      *
      * @param topic a Kafka topic to query the schema for
@@ -85,17 +104,21 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
     public Schema getSchema(String topic) {
         Schema schema = schemas.get(topic);
         if (schema == null) {
-            try {
-                SchemaMetadata schemaMetadata = schemaRegistryClient.getLatestSchemaMetadata(topic + "-value");
-                schema = schemaRegistryClient.getByID(schemaMetadata.getId());
-                schemas.put(topic, schema);
-            } catch (IOException e) {
-                throw new IllegalStateException("Unable to get Avro schema not found for topic " + topic);
-            } catch (RestClientException e) {
-                throw new IllegalStateException("Avro schema not found for topic " + topic);
-            }
+            schema = fetchLatestSchema(topic);
+            schemas.put(topic, schema);
         }
         return schema;
+    }
+
+    private Schema fetchLatestSchema(String topic) {
+        try {
+            SchemaMetadata schemaMetadata = schemaRegistryClient.getLatestSchemaMetadata(topic + "-value");
+            return schemaRegistryClient.getByID(schemaMetadata.getId());
+        } catch (IOException e) {
+            throw new IllegalStateException("Unable to get Avro schema not found for topic " + topic);
+        } catch (RestClientException e) {
+            throw new IllegalStateException("Avro schema not found for topic " + topic);
+        }
     }
 
     @Override

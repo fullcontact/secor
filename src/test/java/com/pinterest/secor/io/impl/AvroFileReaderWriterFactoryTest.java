@@ -19,6 +19,7 @@
 package com.pinterest.secor.io.impl;
 
 import com.google.common.io.Files;
+import com.pinterest.secor.common.ConfigurableAvroSchemaRegistry;
 import com.pinterest.secor.common.LogFilePath;
 import com.pinterest.secor.common.SecorConfig;
 import com.pinterest.secor.common.SecorSchemaRegistryClient;
@@ -30,6 +31,7 @@ import junit.framework.TestCase;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
 import org.apache.avro.file.DataFileReader;
+import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
@@ -43,6 +45,7 @@ import org.powermock.modules.junit4.PowerMockRunner;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -225,5 +228,38 @@ public class AvroFileReaderWriterFactoryTest extends TestCase {
             assertEquals("foo", reader.next().get("data").toString());
             assertFalse(reader.hasNext());
         }
+    }
+
+    @Test
+    public void testReadSerializesRecordsAsConfiguredSchema() throws Exception {
+        // The file was written before the configured schema (/unittest.avsc) changed: it orders
+        // the fields differently and has an extra one.
+        Schema fileSchema = SchemaBuilder.record("event").namespace("mynamespace")
+                .fields()
+                .name("field2").type().longType().noDefault()
+                .name("extra").type().stringType().noDefault()
+                .name("field1").type().stringType().noDefault()
+                .endRecord();
+        String topic = "test-avro-topic";
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[]{"part-1"}, 0, 1, 23232, ".avro");
+        File file = new File(tempLogFilePath.getLogFilePath());
+        file.getParentFile().mkdirs();
+        try (DataFileWriter<GenericRecord> fileWriter = new DataFileWriter<>(new SpecificDatumWriter<>(fileSchema))) {
+            fileWriter.create(fileSchema, file);
+            fileWriter.append(new GenericRecordBuilder(fileSchema)
+                    .set("field2", 1467176315L).set("extra", "x").set("field1", "foo").build());
+        }
+
+        when(config.getAvroMessageSchema()).thenReturn(Collections.singletonMap(topic, "/unittest.avsc"));
+        ConfigurableAvroSchemaRegistry configuredRegistry = new ConfigurableAvroSchemaRegistry(config);
+        mFactory.schemaRegistry = configuredRegistry;
+
+        FileReader fileReader = mFactory.BuildFileReader(tempLogFilePath, null);
+        GenericRecord read = configuredRegistry.deserialize(topic, fileReader.next().getValue());
+        fileReader.close();
+
+        assertEquals("foo", read.get("field1").toString());
+        assertEquals(1467176315L, read.get("field2"));
     }
 }

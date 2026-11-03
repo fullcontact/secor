@@ -121,32 +121,26 @@ public class AvroFileReaderWriterFactoryTest extends TestCase {
     }
 
 
-    @Test
-    public void testWriteResolvesRecordsToFileSchema() throws Exception {
-        Schema schemaV1 = SchemaBuilder.record("UnitTestRecord")
-                .fields()
-                .name("data").type().stringType().noDefault()
-                .name("timestamp").type().nullable().longType().noDefault()
-                .endRecord();
-        // Adds a field ahead of "timestamp", so field positions differ from schemaV1.
-        Schema schemaV2 = SchemaBuilder.record("UnitTestRecord")
-                .fields()
-                .name("data").type().stringType().noDefault()
-                .name("source").type().stringType().stringDefault("unknown")
-                .name("timestamp").type().nullable().longType().noDefault()
-                .endRecord();
-        GenericRecord oldRecord = new GenericRecordBuilder(schemaV1)
-                .set("data", "foo").set("timestamp", 1467176315L).build();
-        GenericRecord newRecord = new GenericRecordBuilder(schemaV2)
-                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+    private static final Schema SCHEMA_V1 = SchemaBuilder.record("UnitTestRecord")
+            .fields()
+            .name("data").type().stringType().noDefault()
+            .name("timestamp").type().nullable().longType().noDefault()
+            .endRecord();
+    // Adds a field ahead of "timestamp", so field positions differ from SCHEMA_V1.
+    private static final Schema SCHEMA_V2 = SchemaBuilder.record("UnitTestRecord")
+            .fields()
+            .name("data").type().stringType().noDefault()
+            .name("source").type().stringType().stringDefault("unknown")
+            .name("timestamp").type().nullable().longType().noDefault()
+            .endRecord();
 
+    private List<GenericRecord> writeAndReadBack(GenericRecord... records) throws Exception {
         String topic = "test-avro-topic";
-        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(schemaV2);
         LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
                 new String[]{"part-1"}, 0, 1, 23232, ".avro");
         FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
         long offset = 23232;
-        for (GenericRecord record : new GenericRecord[]{oldRecord, newRecord}) {
+        for (GenericRecord record : records) {
             byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(record.getSchema()), record);
             when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
             fileWriter.write(new KeyValue(offset++, payload));
@@ -158,12 +152,46 @@ public class AvroFileReaderWriterFactoryTest extends TestCase {
                 new File(tempLogFilePath.getLogFilePath()), new GenericDatumReader<>())) {
             reader.forEach(written::add);
         }
+        return written;
+    }
+
+    @Test
+    public void testWriteResolvesRecordsToFirstRecordSchema() throws Exception {
+        GenericRecord newRecord = new GenericRecordBuilder(SCHEMA_V2)
+                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+        GenericRecord oldRecord = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+
+        List<GenericRecord> written = writeAndReadBack(newRecord, oldRecord);
+
         assertEquals(2, written.size());
+        assertEquals(SCHEMA_V2, written.get(0).getSchema());
+        assertEquals("bar", written.get(0).get("data").toString());
+        assertEquals("web", written.get(0).get("source").toString());
+        assertEquals(1467176344L, written.get(0).get("timestamp"));
+        assertEquals("foo", written.get(1).get("data").toString());
+        assertEquals("unknown", written.get(1).get("source").toString());
+        assertEquals(1467176315L, written.get(1).get("timestamp"));
+    }
+
+    @Test
+    public void testWriteKeepsRecordsOlderThanLatestRegisteredSchema() throws Exception {
+        // The latest registered schema adds a field without a default, so v1 records cannot be
+        // resolved to it.
+        Schema requiresSource = SchemaBuilder.record("UnitTestRecord")
+                .fields()
+                .name("data").type().stringType().noDefault()
+                .name("source").type().stringType().noDefault()
+                .name("timestamp").type().nullable().longType().noDefault()
+                .endRecord();
+        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(requiresSource);
+        GenericRecord oldRecord = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+
+        List<GenericRecord> written = writeAndReadBack(oldRecord);
+
+        assertEquals(1, written.size());
+        assertEquals(SCHEMA_V1, written.get(0).getSchema());
         assertEquals("foo", written.get(0).get("data").toString());
-        assertEquals("unknown", written.get(0).get("source").toString());
-        assertEquals(1467176315L, written.get(0).get("timestamp"));
-        assertEquals("bar", written.get(1).get("data").toString());
-        assertEquals("web", written.get(1).get("source").toString());
-        assertEquals(1467176344L, written.get(1).get("timestamp"));
     }
 }

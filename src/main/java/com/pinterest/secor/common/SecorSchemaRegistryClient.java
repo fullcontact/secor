@@ -30,7 +30,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -48,8 +47,12 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
     // parser's deserialize calls are what reveal newly registered schema versions.
     // Newest known schema of each topic; used as the schema of newly created files.
     private final static Map<String, CachedSchema> schemas = new ConcurrentHashMap<>();
-    // Schema versions already seen in records of each topic.
+    // Schema versions already seen in records of each topic. A schema is added only after the
+    // cache entry its refresh produced is published, so any writer created for one of its
+    // records finds a cached schema.
     private final static Map<String, Set<Schema>> seenSchemas = new ConcurrentHashMap<>();
+    // Serializes each topic's cache refreshes and initialization across the consumer threads.
+    private final static Map<String, Object> topicLocks = new ConcurrentHashMap<>();
     protected SchemaRegistryClient schemaRegistryClient;
 
     public SecorSchemaRegistryClient(SecorConfig config) {
@@ -75,37 +78,44 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
             message = null;
         }
         GenericRecord record = (GenericRecord) deserializer.deserialize(topic, message);
-        if (record != null && seenSchemas.computeIfAbsent(topic, t -> ConcurrentHashMap.newKeySet())
-                .add(record.getSchema())) {
-            refreshLatestSchema(topic, record.getSchema(), schemaId(message));
+        if (record != null && !seenSchemas(topic).contains(record.getSchema())) {
+            refreshLatestSchema(topic, record.getSchema());
         }
         return record;
     }
 
-    // Confluent wire format: a zero magic byte, then the 4-byte big-endian schema ID. The
-    // deserializer has already validated the header of any message it decoded.
-    private static int schemaId(byte[] message) {
-        return ByteBuffer.wrap(message, 1, 4).getInt();
+    private static Set<Schema> seenSchemas(String topic) {
+        return seenSchemas.computeIfAbsent(topic, t -> ConcurrentHashMap.newKeySet());
+    }
+
+    private static Object topicLock(String topic) {
+        return topicLocks.computeIfAbsent(topic, t -> new Object());
     }
 
     // A schema version not seen before may have been registered since the cached latest schema
     // was fetched. Records on older versions do not replace it, so files keep the newest fields.
-    private void refreshLatestSchema(String topic, Schema recordSchema, int recordSchemaId) {
-        CachedSchema latest;
-        try {
-            latest = fetchLatestSchema(topic);
-        } catch (IllegalStateException e) {
-            // Topics whose schema is not registered under "<topic>-value" can only be written
-            // with a schema taken from their records. Any other failure is transient, and
-            // publishing the record's schema cannot replace a cached registered one.
-            if (!isSubjectNotFound(e.getCause())) {
-                LOG.warn("Unable to refresh Avro schema for topic {}; keeping the cached registered schema, if any", topic, e);
+    private void refreshLatestSchema(String topic, Schema recordSchema) {
+        synchronized (topicLock(topic)) {
+            Set<Schema> seen = seenSchemas(topic);
+            if (seen.contains(recordSchema)) {
+                return;
             }
-            latest = CachedSchema.fromRecord(recordSchema, recordSchemaId);
+            CachedSchema latest;
+            try {
+                latest = fetchLatestSchema(topic);
+            } catch (IllegalStateException e) {
+                // Topics whose schema is not registered under "<topic>-value" can only be written
+                // with a schema taken from their records. Any other failure is transient, and
+                // publishing the record's schema cannot replace a cached registered one.
+                if (!isSubjectNotFound(e.getCause())) {
+                    LOG.warn("Unable to refresh Avro schema for topic {}; keeping the cached registered schema, if any",
+                            topic, e);
+                }
+                latest = CachedSchema.fromRecord(recordSchema);
+            }
+            schemas.merge(topic, latest, CachedSchema::newer);
+            seen.add(recordSchema);
         }
-        // Refreshes run concurrently on the consumer threads; merging by recency keeps a slow
-        // refresh that fetched an older version from overwriting a newer one.
-        schemas.merge(topic, latest, CachedSchema::newer);
     }
 
     private static boolean isSubjectNotFound(Throwable e) {
@@ -117,7 +127,8 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
      * Get the latest Avro schema registered for a topic. It is cached, and refreshed by
      * {@link #deserialize(String, byte[])} whenever a record carries a schema version not seen before.
      * It uses standard "subject name" strategy and it is topic_name-value. For a topic without such
-     * a subject, it is the newest schema seen in the topic's records.
+     * a subject, it is the schema most recently seen for the first time in the topic's records,
+     * since without a subject there are no versions to order the schemas by.
      *
      * @param topic a Kafka topic to query the schema for
      * @return Schema object for the topic
@@ -126,7 +137,13 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
     public Schema getSchema(String topic) {
         CachedSchema cached = schemas.get(topic);
         if (cached == null) {
-            cached = schemas.merge(topic, fetchLatestSchema(topic), CachedSchema::newer);
+            synchronized (topicLock(topic)) {
+                cached = schemas.get(topic);
+                if (cached == null) {
+                    cached = fetchLatestSchema(topic);
+                    schemas.put(topic, cached);
+                }
+            }
         }
         return cached.schema;
     }
@@ -150,32 +167,40 @@ public class SecorSchemaRegistryClient implements AvroSchemaRegistry {
     }
 
     private static final class CachedSchema {
-        final Schema schema;
-        final boolean registered;
-        // Registered schemas are ordered by subject version; schemas taken from records by
-        // schema ID, which the registry assigns in increasing order as schemas are registered.
-        final int recency;
+        // Version of schemas taken from records; registry subject versions start at 1.
+        private static final int UNVERSIONED = 0;
 
-        private CachedSchema(Schema schema, boolean registered, int recency) {
+        final Schema schema;
+        // Subject version of a schema fetched from the registry.
+        final int version;
+
+        private CachedSchema(Schema schema, int version) {
             this.schema = schema;
-            this.registered = registered;
-            this.recency = recency;
+            this.version = version;
         }
 
         static CachedSchema registered(Schema schema, int version) {
-            return new CachedSchema(schema, true, version);
+            return new CachedSchema(schema, version);
         }
 
-        static CachedSchema fromRecord(Schema schema, int schemaId) {
-            return new CachedSchema(schema, false, schemaId);
+        static CachedSchema fromRecord(Schema schema) {
+            return new CachedSchema(schema, UNVERSIONED);
         }
 
-        // The registry's latest version of the subject always outranks a schema taken from a record.
+        boolean isRegistered() {
+            return version != UNVERSIONED;
+        }
+
+        // The registry's latest version of the subject always outranks a schema taken from a
+        // record, so a registry outage does not replace it.
         static CachedSchema newer(CachedSchema cached, CachedSchema candidate) {
-            if (cached.registered != candidate.registered) {
-                return cached.registered ? cached : candidate;
+            if (cached.isRegistered() != candidate.isRegistered()) {
+                return cached.isRegistered() ? cached : candidate;
             }
-            return candidate.recency > cached.recency ? candidate : cached;
+            if (!candidate.isRegistered()) {
+                return candidate;
+            }
+            return candidate.version > cached.version ? candidate : cached;
         }
     }
 }

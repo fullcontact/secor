@@ -84,9 +84,10 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             file = new File(logFilePath.getLogFilePath());
             file.getParentFile().mkdirs();
             topic = logFilePath.getTopic();
-            Schema schema = schemaRegistry.getSchema(topic);
 
-            DatumReader datumReader = new SpecificDatumReader(schema);
+            // Reads records as the schema embedded in the file, which the writer took from the
+            // file's first record and which may differ from the topic's latest registered schema.
+            DatumReader<GenericRecord> datumReader = new SpecificDatumReader<>();
             try {
                 reader = new DataFileReader(file, datumReader);
             } catch (IOException e) {
@@ -113,11 +114,13 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
     protected class AvroFileWriter implements FileWriter {
 
+        // Created on the first record, since the file schema is that record's schema.
         private DataFileWriter<GenericRecord> writer;
         // DataFileWriter encodes records by position in the file schema, so records on any other
         // schema version must be resolved to it first.
         private AvroRecordResolver resolver;
         private File file;
+        private CompressionCodec codec;
 
         private String topic;
 
@@ -126,10 +129,15 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             file.getParentFile().mkdirs();
             LOG.debug("Creating Brand new Writer for path {}", logFilePath.getLogFilePath());
             topic = logFilePath.getTopic();
-            Schema schema = schemaRegistry.getSchema(topic);
+            this.codec = codec;
+        }
+
+        // Avro files embed their own schema, so unlike Parquet they need not use the latest
+        // registered one, which records still on an older version may not resolve to (for
+        // example when it adds a field without a default).
+        private void create(Schema schema) throws IOException {
             resolver = new AvroRecordResolver(schema);
-            SpecificDatumWriter specificDatumWriter= new SpecificDatumWriter(schema);
-            writer = new DataFileWriter(specificDatumWriter);
+            writer = new DataFileWriter<>(new SpecificDatumWriter<>(schema));
             writer.setCodec(getCodecFactory(codec));
             writer.create(schema, file);
         }
@@ -152,15 +160,21 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
         @Override
         public void write(KeyValue keyValue) throws IOException {
-            GenericRecord record = resolver.resolve(schemaRegistry.deserialize(topic, keyValue.getValue()));
+            GenericRecord record = schemaRegistry.deserialize(topic, keyValue.getValue());
             LOG.trace("Writing record {}", record);
             if (record != null){
-                writer.append(record);
+                if (writer == null) {
+                    create(record.getSchema());
+                }
+                writer.append(resolver.resolve(record));
             }
         }
 
         @Override
         public void close() throws IOException {
+            if (writer == null) {
+                create(schemaRegistry.getSchema(topic));
+            }
             writer.close();
         }
     }

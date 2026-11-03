@@ -43,7 +43,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 
 public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
@@ -135,11 +137,24 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
         // Avro files embed their own schema, so unlike Parquet they need not use the latest
         // registered one, which records still on an older version may not resolve to (for
         // example when it adds a field without a default).
+        // FileRegistry keeps this writer after a failed write, so the fields are assigned only once
+        // the file is created and a later record can retry.
         private void create(Schema schema) throws IOException {
+            DataFileWriter<GenericRecord> created = new DataFileWriter<>(new SpecificDatumWriter<>(schema));
+            created.setCodec(getCodecFactory(codec));
+            OutputStream out = new FileOutputStream(file);
+            try {
+                created.create(schema, out);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    out.close();
+                } catch (IOException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
+            }
             resolver = new AvroRecordResolver(schema);
-            writer = new DataFileWriter<>(new SpecificDatumWriter<>(schema));
-            writer.setCodec(getCodecFactory(codec));
-            writer.create(schema, file);
+            writer = created;
         }
 
         private CodecFactory getCodecFactory(CompressionCodec codec) {

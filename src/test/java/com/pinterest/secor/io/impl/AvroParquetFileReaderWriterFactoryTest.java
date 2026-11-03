@@ -34,13 +34,16 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.compress.CompressionCodec;
 import org.apache.parquet.avro.AvroParquetReader;
 import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.ParquetWriter;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Matchers;
 import org.mockito.Mockito;
 import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.modules.junit4.PowerMockRunner;
+import org.powermock.reflect.Whitebox;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -190,6 +193,35 @@ public class AvroParquetFileReaderWriterFactoryTest extends TestCase {
         assertEquals(1, written.size());
         assertEquals("bar", written.get(0).get("data").toString());
         assertEquals("web", written.get(0).get("source").toString());
+    }
+
+    @Test
+    public void testWritePropagatesParquetWriteFailures() throws Exception {
+        String topic = "test-avro-topic";
+        SecorSchemaRegistryClient secorSchemaRegistryClient = Mockito.mock(SecorSchemaRegistryClient.class);
+        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(SCHEMA_V1);
+        mFactory.schemaRegistry = secorSchemaRegistryClient;
+        GenericRecord record = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(SCHEMA_V1), record);
+        when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
+
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[] { "part-1" }, 0, 1, 23232, ".avro");
+        FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
+        ParquetWriter<GenericRecord> parquetWriter = Mockito.mock(ParquetWriter.class);
+        IOException failure = new IOException("disk full");
+        Mockito.doThrow(failure).when(parquetWriter).write(record);
+        Whitebox.setInternalState(fileWriter, "writer", parquetWriter);
+
+        // Write failures must reach the consumer's error handling rather than be skipped like
+        // records that cannot be read as the file schema.
+        try {
+            fileWriter.write(new KeyValue(23232, payload));
+            fail("expected the Parquet write failure to propagate");
+        } catch (IOException e) {
+            assertSame(failure, e);
+        }
     }
 
     private static final Schema SCHEMA_V1 = SchemaBuilder.record("UnitTestRecord")

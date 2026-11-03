@@ -41,6 +41,7 @@ import org.mockito.Mockito;
 import org.powermock.modules.junit4.PowerMockRunner;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -193,5 +194,36 @@ public class AvroFileReaderWriterFactoryTest extends TestCase {
         assertEquals(1, written.size());
         assertEquals(SCHEMA_V1, written.get(0).getSchema());
         assertEquals("foo", written.get(0).get("data").toString());
+    }
+
+    @Test
+    public void testWriteRetriesFileCreationAfterFailure() throws Exception {
+        String topic = "test-avro-topic";
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[]{"part-1"}, 0, 1, 23232, ".avro");
+        File file = new File(tempLogFilePath.getLogFilePath());
+        FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
+        GenericRecord record = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(SCHEMA_V1), record);
+        when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
+
+        // A directory at the file's path makes creating the file fail.
+        assertTrue(file.mkdir());
+        try {
+            fileWriter.write(new KeyValue(23232, payload));
+            fail("expected the file creation to fail");
+        } catch (IOException expected) {
+        }
+        assertTrue(file.delete());
+
+        fileWriter.write(new KeyValue(23233, payload));
+        fileWriter.close();
+
+        try (DataFileReader<GenericRecord> reader = new DataFileReader<>(file, new GenericDatumReader<>())) {
+            assertTrue(reader.hasNext());
+            assertEquals("foo", reader.next().get("data").toString());
+            assertFalse(reader.hasNext());
+        }
     }
 }

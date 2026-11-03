@@ -25,6 +25,7 @@ import com.pinterest.secor.io.FileReader;
 import com.pinterest.secor.io.FileReaderWriterFactory;
 import com.pinterest.secor.io.FileWriter;
 import com.pinterest.secor.io.KeyValue;
+import com.pinterest.secor.util.AvroRecordResolver;
 import com.pinterest.secor.util.AvroSchemaRegistryFactory;
 import com.pinterest.secor.util.ParquetUtil;
 import org.apache.avro.AvroRuntimeException;
@@ -113,6 +114,9 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
     protected class AvroFileWriter implements FileWriter {
 
         private DataFileWriter<GenericRecord> writer;
+        // DataFileWriter encodes records by position in the file schema, so records on any other
+        // schema version must be resolved to it first.
+        private AvroRecordResolver resolver;
         private File file;
 
         private String topic;
@@ -123,6 +127,7 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             LOG.debug("Creating Brand new Writer for path {}", logFilePath.getLogFilePath());
             topic = logFilePath.getTopic();
             Schema schema = schemaRegistry.getSchema(topic);
+            resolver = new AvroRecordResolver(schema);
             SpecificDatumWriter specificDatumWriter= new SpecificDatumWriter(schema);
             writer = new DataFileWriter(specificDatumWriter);
             writer.setCodec(getCodecFactory(codec));
@@ -147,7 +152,7 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
         @Override
         public void write(KeyValue keyValue) throws IOException {
-            GenericRecord record = schemaRegistry.deserialize(topic, keyValue.getValue());
+            GenericRecord record = resolver.resolve(schemaRegistry.deserialize(topic, keyValue.getValue()));
             LOG.trace("Writing record {}", record);
             if (record != null){
                 writer.append(record);

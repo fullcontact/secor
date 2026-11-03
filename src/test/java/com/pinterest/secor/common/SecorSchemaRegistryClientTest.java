@@ -19,6 +19,7 @@
 package com.pinterest.secor.common;
 
 import io.confluent.kafka.schemaregistry.client.MockSchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.client.SchemaMetadata;
 import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
 import io.confluent.kafka.schemaregistry.client.rest.exceptions.RestClientException;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
@@ -133,6 +134,90 @@ public class SecorSchemaRegistryClientTest extends TestCase {
         secorSchemaRegistryClient.deserialize(topic, payloadV2);
         secorSchemaRegistryClient.deserialize(topic, payloadV1);
         assertEquals(schemaV2, secorSchemaRegistryClient.getSchema(topic));
+    }
+
+    private static final Schema FOO_V1 = SchemaBuilder.record("Foo")
+            .fields()
+            .name("data_field_1").type().intType().noDefault()
+            .name("timestamp").type().longType().noDefault()
+            .endRecord();
+    private static final Schema FOO_V2 = SchemaBuilder.record("Foo")
+            .fields()
+            .name("data_field_1").type().intType().noDefault()
+            .name("data_field_2").type().stringType().stringDefault("")
+            .name("timestamp").type().longType().noDefault()
+            .endRecord();
+
+    // Serializing under "<subject topic>-value" registers the schemas, v1 before v2.
+    private byte[][] serializeV1AndV2(String subjectTopic) {
+        return new byte[][]{
+                avroSerializer.serialize(subjectTopic, new GenericRecordBuilder(FOO_V1)
+                        .set("data_field_1", 1)
+                        .set("timestamp", 1467176315L)
+                        .build()),
+                avroSerializer.serialize(subjectTopic, new GenericRecordBuilder(FOO_V2)
+                        .set("data_field_1", 2)
+                        .set("data_field_2", "hello")
+                        .set("timestamp", 1467176316L)
+                        .build())};
+    }
+
+    @Test
+    public void testGetSchemaFollowsNewestRecordSchemaWithoutRegisteredSubject() {
+        String topic = "test-avr-topic-5";
+        byte[][] payloads = serializeV1AndV2("test-avr-topic-5-other");
+
+        secorSchemaRegistryClient.deserialize(topic, payloads[0]);
+        assertEquals(FOO_V1, secorSchemaRegistryClient.getSchema(topic));
+        secorSchemaRegistryClient.deserialize(topic, payloads[1]);
+        assertEquals(FOO_V2, secorSchemaRegistryClient.getSchema(topic));
+    }
+
+    @Test
+    public void testGetSchemaIgnoresOlderRecordSchemaWithoutRegisteredSubject() {
+        String topic = "test-avr-topic-6";
+        byte[][] payloads = serializeV1AndV2("test-avr-topic-6-other");
+
+        secorSchemaRegistryClient.deserialize(topic, payloads[1]);
+        secorSchemaRegistryClient.deserialize(topic, payloads[0]);
+        assertEquals(FOO_V2, secorSchemaRegistryClient.getSchema(topic));
+    }
+
+    @Test
+    public void testStaleRefreshDoesNotReplaceNewerRegisteredSchema() throws Exception {
+        String topic = "test-avr-topic-7";
+        int idV1 = schemaRegistryClient.register(topic + "-value", FOO_V1);
+        int idV2 = schemaRegistryClient.register(topic + "-value", FOO_V2);
+        byte[][] payloads = serializeV1AndV2(topic);
+
+        // Simulates a refresh that fetched v1 metadata but published after one that fetched v2.
+        SchemaRegistryClient staleRegistry = Mockito.mock(SchemaRegistryClient.class);
+        when(staleRegistry.getLatestSchemaMetadata(topic + "-value")).thenReturn(
+                new SchemaMetadata(idV2, 2, FOO_V2.toString()),
+                new SchemaMetadata(idV1, 1, FOO_V1.toString()));
+        when(staleRegistry.getByID(idV1)).thenReturn(FOO_V1);
+        when(staleRegistry.getByID(idV2)).thenReturn(FOO_V2);
+        secorSchemaRegistryClient.schemaRegistryClient = staleRegistry;
+
+        secorSchemaRegistryClient.deserialize(topic, payloads[0]);
+        secorSchemaRegistryClient.deserialize(topic, payloads[1]);
+        assertEquals(FOO_V2, secorSchemaRegistryClient.getSchema(topic));
+    }
+
+    @Test
+    public void testRegistryOutageKeepsCachedRegisteredSchema() throws Exception {
+        String topic = "test-avr-topic-8";
+        schemaRegistryClient.register(topic + "-value", FOO_V1);
+        assertEquals(FOO_V1, secorSchemaRegistryClient.getSchema(topic));
+        byte[] payloadV2 = serializeV1AndV2("test-avr-topic-8-other")[1];
+
+        SchemaRegistryClient unavailableRegistry = Mockito.mock(SchemaRegistryClient.class);
+        when(unavailableRegistry.getLatestSchemaMetadata(topic + "-value"))
+                .thenThrow(new IOException("connection refused"));
+        secorSchemaRegistryClient.schemaRegistryClient = unavailableRegistry;
+
+        secorSchemaRegistryClient.deserialize(topic, payloadV2);
+        assertEquals(FOO_V1, secorSchemaRegistryClient.getSchema(topic));
     }
 
     @Test

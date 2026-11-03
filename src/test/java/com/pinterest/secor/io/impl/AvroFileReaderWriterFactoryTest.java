@@ -29,6 +29,8 @@ import com.pinterest.secor.util.AvroSerializer;
 import junit.framework.TestCase;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
+import org.apache.avro.file.DataFileReader;
+import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
 import org.apache.avro.specific.SpecificDatumWriter;
@@ -37,6 +39,10 @@ import org.junit.runner.RunWith;
 import org.mockito.Matchers;
 import org.mockito.Mockito;
 import org.powermock.modules.junit4.PowerMockRunner;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.mockito.Matchers.anyString;
@@ -114,4 +120,50 @@ public class AvroFileReaderWriterFactoryTest extends TestCase {
         assertEquals(msg2, secorSchemaRegistryClient.deserialize("test-avro-topic", kvout.getValue()));
     }
 
+
+    @Test
+    public void testWriteResolvesRecordsToFileSchema() throws Exception {
+        Schema schemaV1 = SchemaBuilder.record("UnitTestRecord")
+                .fields()
+                .name("data").type().stringType().noDefault()
+                .name("timestamp").type().nullable().longType().noDefault()
+                .endRecord();
+        // Adds a field ahead of "timestamp", so field positions differ from schemaV1.
+        Schema schemaV2 = SchemaBuilder.record("UnitTestRecord")
+                .fields()
+                .name("data").type().stringType().noDefault()
+                .name("source").type().stringType().stringDefault("unknown")
+                .name("timestamp").type().nullable().longType().noDefault()
+                .endRecord();
+        GenericRecord oldRecord = new GenericRecordBuilder(schemaV1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        GenericRecord newRecord = new GenericRecordBuilder(schemaV2)
+                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+
+        String topic = "test-avro-topic";
+        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(schemaV2);
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[]{"part-1"}, 0, 1, 23232, ".avro");
+        FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
+        long offset = 23232;
+        for (GenericRecord record : new GenericRecord[]{oldRecord, newRecord}) {
+            byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(record.getSchema()), record);
+            when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
+            fileWriter.write(new KeyValue(offset++, payload));
+        }
+        fileWriter.close();
+
+        List<GenericRecord> written = new ArrayList<>();
+        try (DataFileReader<GenericRecord> reader = new DataFileReader<>(
+                new File(tempLogFilePath.getLogFilePath()), new GenericDatumReader<>())) {
+            reader.forEach(written::add);
+        }
+        assertEquals(2, written.size());
+        assertEquals("foo", written.get(0).get("data").toString());
+        assertEquals("unknown", written.get(0).get("source").toString());
+        assertEquals(1467176315L, written.get(0).get("timestamp"));
+        assertEquals("bar", written.get(1).get("data").toString());
+        assertEquals("web", written.get(1).get("source").toString());
+        assertEquals(1467176344L, written.get(1).get("timestamp"));
+    }
 }

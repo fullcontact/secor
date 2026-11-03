@@ -19,6 +19,7 @@
 package com.pinterest.secor.common;
 
 import com.pinterest.secor.parser.AvroMessageParser;
+import com.pinterest.secor.util.AvroRecordResolver;
 import com.pinterest.secor.util.AvroSerializer;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
@@ -72,9 +73,16 @@ public class ConfigurableAvroSchemaRegistry implements AvroSchemaRegistry {
         return schemas.get(topic);
     }
 
+    /**
+     * Serializes the record as the topic's configured schema, which is the only schema
+     * {@link #deserialize(String, byte[])} reads. A record of another schema version, such as one
+     * read from a file written before the configured schema changed, is resolved to it first.
+     *
+     * @throws IOException if the record cannot be resolved to the configured schema
+     */
     @Override
     public byte[] serialize(String topic, GenericRecord record) throws IOException {
         SpecificDatumWriter<GenericRecord> writer = writers.get(topic);
-        return AvroSerializer.serialize(writer, record);
+        return AvroSerializer.serialize(writer, new AvroRecordResolver(schemas.get(topic)).resolve(record));
     }
 }

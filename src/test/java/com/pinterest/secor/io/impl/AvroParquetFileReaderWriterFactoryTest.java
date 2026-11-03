@@ -30,14 +30,22 @@ import org.apache.avro.SchemaBuilder;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.GenericRecordBuilder;
 import org.apache.avro.specific.SpecificDatumWriter;
+import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.compress.CompressionCodec;
+import org.apache.parquet.avro.AvroParquetReader;
+import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.hadoop.ParquetWriter;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Matchers;
 import org.mockito.Mockito;
 import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.modules.junit4.PowerMockRunner;
+import org.powermock.reflect.Whitebox;
 
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -133,6 +141,129 @@ public class AvroParquetFileReaderWriterFactoryTest extends TestCase {
         testAvroParquetReadWriteRoundTrip(configurableAvroSchemaRegistry);
     }
 
+    @Test
+    public void testWriteFillsDefaultsForRecordsOnOlderSchema() throws Exception {
+        GenericRecord oldRecord = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        GenericRecord newRecord = new GenericRecordBuilder(SCHEMA_V2)
+                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+
+        List<GenericRecord> written = writeAndReadBack(SCHEMA_V2, oldRecord, newRecord);
+
+        assertEquals(2, written.size());
+        assertEquals("foo", written.get(0).get("data").toString());
+        assertEquals("unknown", written.get(0).get("source").toString());
+        assertEquals(1467176315L, written.get(0).get("timestamp"));
+        assertEquals("bar", written.get(1).get("data").toString());
+        assertEquals("web", written.get(1).get("source").toString());
+        assertEquals(1467176344L, written.get(1).get("timestamp"));
+    }
+
+    @Test
+    public void testWriteDropsFieldsMissingFromFileSchema() throws Exception {
+        GenericRecord oldRecord = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        GenericRecord newRecord = new GenericRecordBuilder(SCHEMA_V2)
+                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+
+        List<GenericRecord> written = writeAndReadBack(SCHEMA_V1, oldRecord, newRecord);
+
+        assertEquals(2, written.size());
+        assertEquals("foo", written.get(0).get("data").toString());
+        assertEquals(1467176315L, written.get(0).get("timestamp"));
+        assertEquals("bar", written.get(1).get("data").toString());
+        assertEquals(1467176344L, written.get(1).get("timestamp"));
+    }
+
+    @Test
+    public void testWriteSkipsRecordsIncompatibleWithFileSchema() throws Exception {
+        Schema requiresSource = SchemaBuilder.record("UnitTestRecord")
+                .fields()
+                .name("data").type().stringType().noDefault()
+                .name("source").type().stringType().noDefault()
+                .name("timestamp").type().nullable().longType().noDefault()
+                .endRecord();
+        GenericRecord incompatible = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        GenericRecord compatible = new GenericRecordBuilder(SCHEMA_V2)
+                .set("data", "bar").set("source", "web").set("timestamp", 1467176344L).build();
+
+        List<GenericRecord> written = writeAndReadBack(requiresSource, incompatible, compatible);
+
+        assertEquals(1, written.size());
+        assertEquals("bar", written.get(0).get("data").toString());
+        assertEquals("web", written.get(0).get("source").toString());
+    }
+
+    @Test
+    public void testWritePropagatesParquetWriteFailures() throws Exception {
+        String topic = "test-avro-topic";
+        SecorSchemaRegistryClient secorSchemaRegistryClient = Mockito.mock(SecorSchemaRegistryClient.class);
+        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(SCHEMA_V1);
+        mFactory.schemaRegistry = secorSchemaRegistryClient;
+        GenericRecord record = new GenericRecordBuilder(SCHEMA_V1)
+                .set("data", "foo").set("timestamp", 1467176315L).build();
+        byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(SCHEMA_V1), record);
+        when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
+
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[] { "part-1" }, 0, 1, 23232, ".avro");
+        FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
+        ParquetWriter<GenericRecord> parquetWriter = Mockito.mock(ParquetWriter.class);
+        IOException failure = new IOException("disk full");
+        Mockito.doThrow(failure).when(parquetWriter).write(record);
+        Whitebox.setInternalState(fileWriter, "writer", parquetWriter);
+
+        // Write failures must reach the consumer's error handling rather than be skipped like
+        // records that cannot be read as the file schema.
+        try {
+            fileWriter.write(new KeyValue(23232, payload));
+            fail("expected the Parquet write failure to propagate");
+        } catch (IOException e) {
+            assertSame(failure, e);
+        }
+    }
+
+    private static final Schema SCHEMA_V1 = SchemaBuilder.record("UnitTestRecord")
+            .fields()
+            .name("data").type().stringType().noDefault()
+            .name("timestamp").type().nullable().longType().noDefault()
+            .endRecord();
+
+    // Adds a field ahead of "timestamp", so field positions differ from SCHEMA_V1.
+    private static final Schema SCHEMA_V2 = SchemaBuilder.record("UnitTestRecord")
+            .fields()
+            .name("data").type().stringType().noDefault()
+            .name("source").type().stringType().stringDefault("unknown")
+            .name("timestamp").type().nullable().longType().noDefault()
+            .endRecord();
+
+    private List<GenericRecord> writeAndReadBack(Schema fileSchema, GenericRecord... records) throws Exception {
+        String topic = "test-avro-topic";
+        SecorSchemaRegistryClient secorSchemaRegistryClient = Mockito.mock(SecorSchemaRegistryClient.class);
+        when(secorSchemaRegistryClient.getSchema(anyString())).thenReturn(fileSchema);
+        mFactory.schemaRegistry = secorSchemaRegistryClient;
+
+        LogFilePath tempLogFilePath = new LogFilePath(Files.createTempDir().toString(), topic,
+                new String[] { "part-1" }, 0, 1, 23232, ".avro");
+        FileWriter fileWriter = mFactory.BuildFileWriter(tempLogFilePath, null);
+        long offset = 23232;
+        for (GenericRecord record : records) {
+            byte[] payload = AvroSerializer.serialize(new SpecificDatumWriter<>(record.getSchema()), record);
+            when(secorSchemaRegistryClient.deserialize(topic, payload)).thenReturn(record);
+            fileWriter.write(new KeyValue(offset++, payload));
+        }
+        fileWriter.close();
+
+        List<GenericRecord> written = new ArrayList<>();
+        try (ParquetReader<GenericRecord> reader = AvroParquetReader
+                .<GenericRecord>builder(new Path(tempLogFilePath.getLogFilePath())).build()) {
+            for (GenericRecord record = reader.read(); record != null; record = reader.read()) {
+                written.add(record);
+            }
+        }
+        return written;
+    }
 
     private void testAvroParquetReadWriteRoundTrip(AvroSchemaRegistry schemaRegistry) throws Exception {
 

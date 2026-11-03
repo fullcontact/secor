@@ -25,6 +25,7 @@ import com.pinterest.secor.io.FileReader;
 import com.pinterest.secor.io.FileReaderWriterFactory;
 import com.pinterest.secor.io.FileWriter;
 import com.pinterest.secor.io.KeyValue;
+import com.pinterest.secor.util.AvroRecordResolver;
 import com.pinterest.secor.util.AvroSchemaRegistryFactory;
 import com.pinterest.secor.util.ParquetUtil;
 import org.apache.avro.AvroRuntimeException;
@@ -42,7 +43,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 
 public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
@@ -83,9 +86,10 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             file = new File(logFilePath.getLogFilePath());
             file.getParentFile().mkdirs();
             topic = logFilePath.getTopic();
-            Schema schema = schemaRegistry.getSchema(topic);
 
-            DatumReader datumReader = new SpecificDatumReader(schema);
+            // Reads records as the schema embedded in the file, which the writer took from the
+            // file's first record and which may differ from the topic's latest registered schema.
+            DatumReader<GenericRecord> datumReader = new SpecificDatumReader<>();
             try {
                 reader = new DataFileReader(file, datumReader);
             } catch (IOException e) {
@@ -112,8 +116,13 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
 
     protected class AvroFileWriter implements FileWriter {
 
+        // Created on the first record, since the file schema is that record's schema.
         private DataFileWriter<GenericRecord> writer;
+        // DataFileWriter encodes records by position in the file schema, so records on any other
+        // schema version must be resolved to it first.
+        private AvroRecordResolver resolver;
         private File file;
+        private CompressionCodec codec;
 
         private String topic;
 
@@ -122,11 +131,30 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             file.getParentFile().mkdirs();
             LOG.debug("Creating Brand new Writer for path {}", logFilePath.getLogFilePath());
             topic = logFilePath.getTopic();
-            Schema schema = schemaRegistry.getSchema(topic);
-            SpecificDatumWriter specificDatumWriter= new SpecificDatumWriter(schema);
-            writer = new DataFileWriter(specificDatumWriter);
-            writer.setCodec(getCodecFactory(codec));
-            writer.create(schema, file);
+            this.codec = codec;
+        }
+
+        // Avro files embed their own schema, so unlike Parquet they need not use the latest
+        // registered one, which records still on an older version may not resolve to (for
+        // example when it adds a field without a default).
+        // FileRegistry keeps this writer after a failed write, so the fields are assigned only once
+        // the file is created and a later record can retry.
+        private void create(Schema schema) throws IOException {
+            DataFileWriter<GenericRecord> created = new DataFileWriter<>(new SpecificDatumWriter<>(schema));
+            created.setCodec(getCodecFactory(codec));
+            OutputStream out = new FileOutputStream(file);
+            try {
+                created.create(schema, out);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    out.close();
+                } catch (IOException closeFailure) {
+                    e.addSuppressed(closeFailure);
+                }
+                throw e;
+            }
+            resolver = new AvroRecordResolver(schema);
+            writer = created;
         }
 
         private CodecFactory getCodecFactory(CompressionCodec codec) {
@@ -150,12 +178,18 @@ public class AvroFileReaderWriterFactory implements FileReaderWriterFactory {
             GenericRecord record = schemaRegistry.deserialize(topic, keyValue.getValue());
             LOG.trace("Writing record {}", record);
             if (record != null){
-                writer.append(record);
+                if (writer == null) {
+                    create(record.getSchema());
+                }
+                writer.append(resolver.resolve(record));
             }
         }
 
         @Override
         public void close() throws IOException {
+            if (writer == null) {
+                create(schemaRegistry.getSchema(topic));
+            }
             writer.close();
         }
     }

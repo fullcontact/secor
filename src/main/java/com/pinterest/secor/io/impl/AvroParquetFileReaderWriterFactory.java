@@ -25,6 +25,7 @@ import com.pinterest.secor.io.FileReader;
 import com.pinterest.secor.io.FileReaderWriterFactory;
 import com.pinterest.secor.io.FileWriter;
 import com.pinterest.secor.io.KeyValue;
+import com.pinterest.secor.util.AvroRecordResolver;
 import com.pinterest.secor.util.AvroSchemaRegistryFactory;
 import com.pinterest.secor.util.ParquetUtil;
 import org.apache.avro.Schema;
@@ -37,7 +38,6 @@ import org.apache.parquet.avro.AvroParquetWriter;
 import org.apache.parquet.hadoop.ParquetReader;
 import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
-import org.apache.avro.AvroTypeException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -107,6 +107,9 @@ public class AvroParquetFileReaderWriterFactory implements FileReaderWriterFacto
 
         private ParquetWriter writer;
         private String topic;
+        // AvroWriteSupport reads record fields by position in the file schema, so records on any
+        // other schema version must be resolved to it first.
+        private AvroRecordResolver resolver;
 
         public AvroParquetFileWriter(LogFilePath logFilePath, CompressionCodec codec) throws IOException {
             Path path = new Path(logFilePath.getLogFilePath());
@@ -114,9 +117,11 @@ public class AvroParquetFileReaderWriterFactory implements FileReaderWriterFacto
             CompressionCodecName codecName = CompressionCodecName
                     .fromCompressionCodec(codec != null ? codec.getClass() : null);
             topic = logFilePath.getTopic();
+            Schema schema = schemaRegistry.getSchema(topic);
+            resolver = new AvroRecordResolver(schema);
             // Not setting blockSize, pageSize, enableDictionary, and validating
             writer = AvroParquetWriter.builder(path)
-                    .withSchema(schemaRegistry.getSchema(topic))
+                    .withSchema(schema)
                     .withCompressionCodec(codecName)
                     .build();
         }
@@ -128,14 +133,19 @@ public class AvroParquetFileReaderWriterFactory implements FileReaderWriterFacto
 
         @Override
         public void write(KeyValue keyValue) throws IOException {
-            try{
-                GenericRecord record = schemaRegistry.deserialize(topic, keyValue.getValue());
-                LOG.trace("Writing record {}", record);
-                if (record != null){
-                    writer.write(record);
-                }
-            } catch (Exception ex){
-                LOG.warn("Skipped record due to deserialization exception: " + ex.getMessage());
+            GenericRecord record;
+            try {
+                record = resolver.resolve(schemaRegistry.deserialize(topic, keyValue.getValue()));
+            } catch (Exception ex) {
+                // Skip records that cannot be read as the file schema (corrupt payloads or
+                // incompatible schema changes) rather than blocking the partition on them.
+                LOG.warn("Skipped record at offset {} of topic {}: cannot read it as schema {}",
+                        keyValue.getOffset(), topic, resolver.getFileSchema().getFullName(), ex);
+                return;
+            }
+            LOG.trace("Writing record {}", record);
+            if (record != null) {
+                writer.write(record);
             }
         }
 
